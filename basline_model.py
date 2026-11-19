@@ -6,7 +6,7 @@
 #   Cell 3  Formula check (old step 1)
 #   Cell 4  Run the simulation (old steps 2 and 3)
 #   Cell 5  Checks with explicit rejection thresholds (old step 4)
-#   Cell 6  Plot
+#   Cell 6  Plots (flow-performance, survival vs Proposition 4)
 #   Cell 7  Replication of the paper's Figure 1 (flow of new funds by fund age)
 # =====================================================================
 
@@ -122,6 +122,41 @@ def simulate_one_fund(params, fund_id):
     return results
 
 
+def survival_prop4(params, n_grid=2000):
+    """Survival probabilities P_1, ..., P_T from the paper's Proposition 4 (p. 18), computed
+    numerically. This is the comparand for check 2: it comes from the model's FORMULA,
+    not from the simulation, so the two can be compared.
+
+    How it works: a fund survives to year t if its belief phi has stayed above phi_bar in
+    every year so far. Averaging over managers' unknown skill (as Proposition 4 does),
+    each year's change in belief is Normal with mean 0 and variance
+        1/(gamma + (t-1)*omega) - 1/(gamma + t*omega)
+    (the drop in the market's uncertainty about skill that year). So we track the
+    density of phi on a grid, one year at a time: spread it out by that Normal change,
+    then cut off the part below phi_bar (those funds close). The area that is left
+    is P_t. This gives the same answer as eqs. 29-30 in Propositions 3-4."""
+    omega, gamma = precisions(params)
+    phi0, eta, phi_bar, T = params["phi0"], params["eta"], params["phi_bar"], params["T"]
+
+    grid = np.linspace(phi_bar, phi0 + 8 * eta, n_grid)   # beliefs at or above phi_bar
+    step = grid[1] - grid[0]
+
+    P = []
+    density = None
+    for t in range(1, T + 1):
+        sd = np.sqrt(1 / (gamma + (t - 1) * omega) - 1 / (gamma + t * omega))
+        if t == 1:
+            # Year 1: everyone starts at phi0
+            density = stats.norm.pdf(grid, phi0, sd)
+        else:
+            # Spread last year's surviving density by this year's change in belief
+            kernel = stats.norm.pdf(grid[:, None], grid[None, :], sd)   # rows: new phi, cols: old phi
+            density = kernel @ density * step
+        # Only the grid at or above phi_bar is kept, so funds below it drop out automatically
+        P.append(density.sum() * step)
+    return pd.Series(P, index=range(1, T + 1), name="P_t (Prop. 4)")
+
+
 def run_simulation(params, N, seed):
     """Simulate N funds and return one table with one row per fund-year.
     The seed is set ONCE here, so every fund gets different draws but the
@@ -195,14 +230,34 @@ print(df.groupby("t")["r"].mean().round(4).to_string())
 print()
 summary.append(["1. Mean investor return = 0", f"{df['r'].mean():.4f}", f"{t1.pvalue:.3f}", verdict(t1.pvalue)])
 
-# ---- Check 2: survival ----
-# TODO: needs a comparand before it can have a threshold
+# ---- Check 2: survival vs the paper's formula (Proposition 4, p. 18; Figure 2, p. 27) ----
+# Comparand: P_t, the survival probability the model predicts (Proposition 4).
+# For each year t: H0: the true survival probability equals P_t.
+# Test: binomial test (survivors out of N, against probability P_t).
+# Because we test 20 years at once, a correct model would "fail" at least one of them
+# fairly often by chance. So we use a Bonferroni correction: the check fails only if
+# some year has p < SIG_LEVEL / T. (This is conservative, i.e. it fails less easily.)
 open_end = df[df["closed"] == False]                    # open at the end of year t
-survival = open_end.groupby("t")["fund"].count() / N
-print("CHECK 2: Share of funds still open at the end of each year (descriptive, comparand TO DO)")
-print(survival.round(3).to_string())
+n_open = open_end.groupby("t")["fund"].count().reindex(range(1, T + 1), fill_value=0)
+survival = n_open / N
+P_theory = survival_prop4(params)
+
+pvals2 = [stats.binomtest(int(n_open.loc[t]), N, P_theory.loc[t]).pvalue for t in range(1, T + 1)]
+check2 = pd.DataFrame({"simulated": survival, "Prop. 4": P_theory,
+                       "difference": survival - P_theory, "p-value": pvals2})
+bonf = SIG_LEVEL / T
+p2_min = min(pvals2)
+verdict2 = "FAIL (reject H0)" if p2_min < bonf else "PASS (do not reject H0)"
+
+print("CHECK 2: Survival vs Proposition 4")
+print(f"  H0 (each year t): survival probability = P_t from Prop. 4   |   test: binomial test   |   "
+      f"reject if any p < {SIG_LEVEL}/{T} = {bonf:.4f} (Bonferroni)")
+print(check2.round(4).to_string())
+print(f"  smallest p-value = {p2_min:.3f}  ->  {verdict2}")
 print()
-summary.append(["2. Survival vs paper", f"{survival.loc[T]:.3f} at year {T}", "-", "TO DO: needs comparand"])
+summary.append(["2. Survival = Prop. 4 (all years)",
+                f"{survival.loc[T]:.3f} vs {P_theory.loc[T]:.3f} at year {T}",
+                f"{p2_min:.3f} (min)", verdict2])
 
 # ---- Check 3: survivors' true skill matches the public belief about them ----
 # H0: among survivors, mean alpha = mean phi (beliefs are correct on average)
@@ -233,6 +288,23 @@ print(f"  corr = {t4.statistic:.4f}, p = {t4.pvalue:.3f}  ->  {verdict(t4.pvalue
 print()
 summary.append(["4. No return predictability", f"{t4.statistic:.4f}", f"{t4.pvalue:.3f}", verdict(t4.pvalue)])
 
+# ---- Check 5: share of managers skilled enough to beat their fee (Figure 4, p. 29) ----
+# The paper: "about 80% of managers" have alpha above the 1.5% fee. With skill drawn from
+# Normal(phi0, eta^2), the exact share is 1 - Phi((f - phi0) / eta).
+# H0: the share of simulated managers with alpha > f equals this value.
+# Test: binomial test (managers with alpha > f, out of N).
+share_theory = 1 - stats.norm.cdf((params["f"] - params["phi0"]) / params["eta"])
+n_beat = int((all_alpha > params["f"]).sum())
+share_sim = n_beat / N
+t5 = stats.binomtest(n_beat, N, share_theory)
+print("CHECK 5: Share of managers whose skill beats the fee (paper's Figure 4: about 80%)")
+print("  H0: share with alpha > f = 1 - Phi((f - phi0)/eta)   |   test: binomial test   |   reject if p < "
+      f"{SIG_LEVEL}")
+print(f"  simulated share = {share_sim:.3f}, theory = {share_theory:.3f}, p = {t5.pvalue:.3f}  ->  {verdict(t5.pvalue)}")
+print()
+summary.append(["5. Share beating fee (Fig. 4)", f"{share_sim:.3f} vs {share_theory:.3f}",
+                f"{t5.pvalue:.3f}", verdict(t5.pvalue)])
+
 # ---- Summary table ----
 summary_df = pd.DataFrame(summary, columns=["Check", "Value", "p-value", "Verdict"])
 print(f"SUMMARY (seed = {SEED}, N = {N}, significance level = {SIG_LEVEL})")
@@ -257,6 +329,20 @@ ax.set_title("Flow-performance relationship by fund age")
 ax.legend()
 fig.savefig("flow_performance.png", dpi=150, bbox_inches="tight")
 print("Plot saved as flow_performance.png")
+
+# ---- Survival: simulation vs Proposition 4 (compare with the dark bars of the paper's Figure 2) ----
+fig, ax = plt.subplots(figsize=(8, 5))
+years = np.arange(1, T + 1)
+ax.bar(years - 0.2, survival.values, width=0.4, label=f"Simulated (N = {N}, seed {SEED})")
+ax.bar(years + 0.2, P_theory.values, width=0.4, label="Proposition 4 (formula)")
+ax.set_xticks(years)
+ax.set_ylim(0, 1)
+ax.set_xlabel("Years in business")
+ax.set_ylabel("Share of funds surviving")
+ax.set_title("Fund survival: simulation vs Proposition 4 (cf. paper's Figure 2)")
+ax.legend()
+fig.savefig("survival.png", dpi=150, bbox_inches="tight")
+print("Plot saved as survival.png")
 
 
 #%% 7. Replication of the paper's Figure 1 (p. 24): flow of new funds by fund age
