@@ -8,6 +8,8 @@
 #   Cell 5  Checks with explicit rejection thresholds (old step 4)
 #   Cell 6  Plots (flow-performance, survival vs Proposition 4)
 #   Cell 7  Replication of the paper's Figure 1 (flow of new funds by fund age)
+#   Cell 8  Power check: rejection rates of every check across many seeds
+#   Cell 9  Figure 1 dots vs curves: eq. 47 vs conditioning on the realised return
 # =====================================================================
 
 #%% 1. Imports and inputs
@@ -40,6 +42,16 @@ SIG_LEVEL = 0.05   # rejection threshold for the statistical checks (5%)
 N_FIG = 5000                 # number of funds for the Figure 1 replication
 FIG1_SEEDS = [1, 2, 3, 4, 5] # several seeds, to show the result doesn't depend on luck
 FIG1_AGES = [2, 5, 10, 20]   # fund ages shown in the paper's Figure 1
+
+# ---- Power check settings (cell 8) ----
+RUN_POWER_CHECK = True       # set to False to skip cell 8 (it takes about a minute)
+POWER_N = 1000               # funds per run (same as the main run)
+POWER_SEEDS = 1000           # number of runs; each run repeats checks 1-5
+
+# ---- Figure 1 dots-vs-curves settings (cell 9) ----
+N_BIG = 50000                # large N, so small-sample noise can be ruled out
+DOTS_AGES = [2, 5, 10]       # ages with enough funds at very negative returns
+MIN_BIN_COUNT = 200          # only show return bins with at least this many funds
 
 # Note: omega (= 1/sigma^2) and gamma (= 1/eta^2) are deliberately NOT stored here.
 # They are calculated from sigma and eta inside the functions, so they can never get out of step with them.
@@ -120,6 +132,23 @@ def simulate_one_fund(params, fund_id):
         q_old = q      # this year's size becomes "last year's" for next year
 
     return results
+
+
+def add_standardised_surprise(df, params):
+    """Add columns phi_prev (belief at the start of the year) and z (standardised surprise).
+
+    Given everything known at the start of year t, the model says
+        R_t - phi_{t-1} ~ Normal(0, 1/omega + 1/(gamma + (t-1)*omega))
+    (luck plus remaining uncertainty about skill). Dividing by that sd gives z,
+    which should be Normal(0, 1) for EVERY fund and year. The investor return r is
+    this surprise times the active share 2f/phi, so r is more volatile for funds with
+    low beliefs (eq. 50). z removes that difference in volatility."""
+    omega, gamma = precisions(params)
+    df = df.copy()
+    df["phi_prev"] = df.groupby("fund")["phi"].shift(1).fillna(params["phi0"])
+    sd = np.sqrt(1 / omega + 1 / (gamma + (df["t"] - 1) * omega))
+    df["z"] = (df["R"] - df["phi_prev"]) / sd
+    return df
 
 
 def survival_prop4(params, n_grid=2000):
@@ -207,7 +236,7 @@ print()
 # "PASS" means the test does NOT reject the model's prediction
 #
 # Assumption: the tests treat fund-years as independent observations.
-# Check 4 supports this for investor returns, but it is an assumption.
+# Cell 8 checks whether each test rejects at the right rate (5%) across many seeds.
 #
 # Note: at a 5% level, a correct model will still "fail" about 1 run in 20 by chance.
 
@@ -277,16 +306,25 @@ summary.append(["3. Survivors: mean alpha = mean phi",
                 f"{t3.pvalue:.3f}", verdict(t3.pvalue)])
 
 # ---- Check 4: past returns don't predict future returns ----
-# H0: correlation between this year's r and last year's r (same fund) = 0
+# H0: corr(this year's surprise, last year's surprise) = 0, same fund.
+# Why the standardised surprise z and not r itself: in the model the volatility of r
+# differs across funds and persists over time (eq. 50: it depends on the belief phi).
+# The Pearson test assumes every pair is equally noisy, so on r it rejects too often
+# even when the true correlation is exactly 0 (see cell 8). z has the same volatility
+# for every fund-year, so the test is valid on z. r is still reported, as a description.
+df = add_standardised_surprise(df, params)
+df["z_last_year"] = df.groupby("fund")["z"].shift(1)
 df["r_last_year"] = df.groupby("fund")["r"].shift(1)
-pairs = df.dropna(subset=["r_last_year"])                # rows that have a previous year
-t4 = stats.pearsonr(pairs["r"], pairs["r_last_year"])
-print("CHECK 4: Predictability of investor returns")
-print("  H0: corr(r this year, r last year) = 0   |   test: Pearson correlation test   |   reject if p < "
+pairs = df.dropna(subset=["z_last_year"])                # rows that have a previous year
+t4 = stats.pearsonr(pairs["z"], pairs["z_last_year"])
+corr_r = pairs["r"].corr(pairs["r_last_year"])
+print("CHECK 4: Predictability of returns")
+print("  H0: corr(z this year, z last year) = 0   |   test: Pearson correlation test on z   |   reject if p < "
       f"{SIG_LEVEL}")
-print(f"  corr = {t4.statistic:.4f}, p = {t4.pvalue:.3f}  ->  {verdict(t4.pvalue)}")
+print(f"  corr(z) = {t4.statistic:.4f}, p = {t4.pvalue:.3f}  ->  {verdict(t4.pvalue)}")
+print(f"  (descriptive: corr(r this year, r last year) = {corr_r:.4f}; sd of z = {df['z'].std():.3f}, model says 1)")
 print()
-summary.append(["4. No return predictability", f"{t4.statistic:.4f}", f"{t4.pvalue:.3f}", verdict(t4.pvalue)])
+summary.append(["4. No return predictability (z)", f"{t4.statistic:.4f}", f"{t4.pvalue:.3f}", verdict(t4.pvalue)])
 
 # ---- Check 5: share of managers skilled enough to beat their fee (Figure 4, p. 29) ----
 # The paper: "about 80% of managers" have alpha above the 1.5% fee. With skill drawn from
@@ -443,3 +481,120 @@ for age in FIG1_AGES:
 fig1_table = pd.DataFrame(rows, columns=["age", "r", "mean new flow", "range across seeds"])
 print("FIGURE 1 VALUES (compare with values read off the paper's Figure 1)")
 print(fig1_table.round(3).to_string(index=False))
+
+
+#%% 8. Power check: how often does each check reject, across many seeds?
+# One seed can fail a check by chance (at 5%, about 1 run in 20). To rule out code
+# errors, repeat every check for POWER_SEEDS independent runs. If the code and the
+# tests are correct, each check should reject in about 5% of runs.
+# The last column tests that: H0: rejection rate = 5% (binomial test).
+
+def run_checks(df, params, P_theory):
+    """Run checks 1-5 on one simulated table. Returns one p-value per check."""
+    T = params["T"]
+    n = len(df["fund"].unique())
+    survivors = df[(df["t"] == T) & (df["closed"] == False)]
+    alpha = df.groupby("fund")["alpha"].first()
+
+    p1 = stats.ttest_1samp(df["r"], 0).pvalue
+
+    n_open = df[df["closed"] == False].groupby("t")["fund"].count().reindex(range(1, T + 1), fill_value=0)
+    p2 = min(stats.binomtest(int(n_open.loc[t]), n, P_theory.loc[t]).pvalue for t in range(1, T + 1)) * T  # Bonferroni
+    p3 = stats.ttest_rel(survivors["alpha"], survivors["phi"]).pvalue
+
+    d = add_standardised_surprise(df, params)
+    d["z_lag"] = d.groupby("fund")["z"].shift(1)
+    d["r_lag"] = d.groupby("fund")["r"].shift(1)
+    q = d.dropna(subset=["z_lag"])
+    p4_z = stats.pearsonr(q["z"], q["z_lag"]).pvalue
+    p4_r = stats.pearsonr(q["r"], q["r_lag"]).pvalue          # the old version of check 4, for comparison
+
+    share = 1 - stats.norm.cdf((params["f"] - params["phi0"]) / params["eta"])
+    p5 = stats.binomtest(int((alpha > params["f"]).sum()), n, share).pvalue
+    return [p1, p2, p3, p4_z, p4_r, p5]
+
+
+if RUN_POWER_CHECK:
+    check_names = ["1. Mean investor return = 0", "2. Survival = Prop. 4 (Bonferroni)",
+                   "3. Survivors: mean alpha = mean phi", "4. No predictability, on z (used)",
+                   "4. No predictability, on r (old)", "5. Share beating fee (Fig. 4)"]
+    P_theory_power = survival_prop4(params)
+    pvals = np.array([run_checks(run_simulation(params, POWER_N, s), params, P_theory_power)
+                      for s in range(1, POWER_SEEDS + 1)])
+
+    rows = []
+    for j, name in enumerate(check_names):
+        k = int((pvals[:, j] < SIG_LEVEL).sum())
+        rows.append([name, k, k / POWER_SEEDS, stats.binomtest(k, POWER_SEEDS, SIG_LEVEL).pvalue])
+    power_table = pd.DataFrame(rows, columns=["Check", "rejections", "rejection rate", "p (rate = 5%)"])
+    print(f"POWER CHECK: rejection rates across {POWER_SEEDS} seeds (N = {POWER_N}, level = {SIG_LEVEL})")
+    print("  A correct test on correct code rejects in about 5% of runs.")
+    print(power_table.round(3).to_string(index=False))
+    print()
+
+
+#%% 9. Figure 1: why do the dots fall below the curves for bad returns?
+# Two different questions give two different curves:
+#   (a) eq. 47 (the paper, and the curves in cell 7): average over ALL funds alive at
+#       age a, as if every one of them received return r. Each fund gets equal weight.
+#   (b) the dots: average over the funds that ACTUALLY earned return r.
+# In the model, r is more volatile for funds with low beliefs (eq. 50: active share
+# 2f/phi is larger). So among the funds that actually earned a very bad r, low-belief
+# funds are over-represented, and more of them close. To get (b) from the formula,
+# weight each fund by how likely it was to earn r given its belief (Bayes' rule):
+#   weight = Normal density of r with mean 0 and sd (2f/phi) * sqrt(1/omega + 1/(gamma + (t-1)*omega))
+# Using a large N rules out small-sample noise as the explanation.
+
+def figure1_curve_weighted(df, age, params, r_values):
+    """Like figure1_curve, but each fund is weighted by the likelihood of earning r (version b)."""
+    omega, gamma = precisions(params)
+    t = age + 1
+    phis = df[(df["t"] == age) & (df["closed"] == False)]["phi"].to_numpy()
+    r = np.asarray(r_values)[:, None]
+    phi_old = phis[None, :]
+    R = phi_old + r / (2 * params["f"] / phi_old)
+    closes = update_belief(phi_old, R, t, params) < params["phi_bar"]
+    flows = np.where(closes, -1.0, eq46_new_flow(r, t, params))
+    sd_r = (2 * params["f"] / phi_old) * np.sqrt(1 / omega + 1 / (gamma + (t - 1) * omega))
+    w = stats.norm.pdf(r, 0, sd_r)
+    return (flows * w).sum(axis=1) / w.sum(axis=1)
+
+
+df_big = run_simulation(params, N_BIG, SEED)
+df_big["new_flow"] = np.where(df_big["closed"], -1.0, df_big["flow"] - df_big["r"])
+
+fig, ax = plt.subplots(figsize=(8, 5.5))
+r_neg = np.linspace(-0.45, 0.1, 221)
+dots_rows = []
+for age in DOTS_AGES:
+    c = colours[age]
+    ax.plot(r_neg, figure1_curve(df_big, age, params, r_neg), color=c, linestyle="--", linewidth=1,
+            label=f"{age} yrs: eq. 47 (every fund gets r)")
+    ax.plot(r_neg, figure1_curve_weighted(df_big, age, params, r_neg), color=c, linewidth=1.5,
+            label=f"{age} yrs: weighted by P(r | phi)")
+
+    year = df_big[df_big["t"] == age + 1].copy()
+    year["bin"] = pd.cut(year["r"], np.arange(-0.42, 0.12, 0.04))
+    b = year.groupby("bin", observed=True).agg(r=("r", "mean"), dots=("new_flow", "mean"), n=("r", "size"))
+    b = b[b["n"] >= MIN_BIN_COUNT]
+    ax.scatter(b["r"], b["dots"], color=c, s=20, edgecolor="black", linewidth=0.4, zorder=3)
+
+    b["eq. 47"] = figure1_curve(df_big, age, params, b["r"].to_numpy())
+    b["weighted"] = figure1_curve_weighted(df_big, age, params, b["r"].to_numpy())
+    b.insert(0, "age", age)
+    dots_rows.append(b[b["r"] < -0.05])
+
+ax.axhline(0, color="grey", linewidth=0.8)
+ax.set_xlim(-0.45, 0.1)
+ax.set_ylim(-1.1, 0.4)
+ax.set_xlabel("Investor return r")
+ax.set_ylabel("Flow of new funds")
+ax.set_title(f"Figure 1, negative returns: eq. 47 vs conditioning on the realised return\n"
+             f"(N = {N_BIG}, seed {SEED}; dots = simulated outcomes)")
+ax.legend(fontsize=8)
+fig.savefig("figure1_dots_vs_curves.png", dpi=150, bbox_inches="tight")
+print("Plot saved as figure1_dots_vs_curves.png")
+
+dots_table = pd.concat(dots_rows)[["age", "n", "r", "dots", "eq. 47", "weighted"]]
+print(f"FIGURE 1 DOTS vs CURVES (N = {N_BIG}, negative returns)")
+print(dots_table.round(3).to_string(index=False))
