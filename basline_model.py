@@ -406,17 +406,9 @@ def figure1_curve(df, age, params, r_grid):
     """Average new flow at each return in r_grid, for funds alive at the end of year `age` (eq. 47)."""
     t = age + 1                                                       # the year the return happens
     phis = df[(df["t"] == age) & (df["closed"] == False)]["phi"].to_numpy()
-
-    # Every combination of (return on the grid) x (surviving fund):
-    # rows = returns, columns = funds
     r = r_grid[:, None]
     phi_old = phis[None, :]
-
-    # Turn the investor return r back into the manager's return R:
-    # r = (2f/phi)(R - phi)  =>  R = phi + r / (2f/phi)
     R = phi_old + r / (2 * params["f"] / phi_old)
-
-    # Would the fund close? Same functions as the simulation (equivalent to eq. 44)
     phi_new = update_belief(phi_old, R, t, params)
     closes = phi_new < params["phi_bar"]
 
