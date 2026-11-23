@@ -7,9 +7,9 @@
 #   Cell 4  Run the simulation (old steps 2 and 3)
 #   Cell 5  Checks with explicit rejection thresholds (old step 4)
 #   Cell 6  Plots (flow-performance, survival vs Proposition 4)
-#   Cell 7  Replication of the paper's Figure 1 (flow of new funds by fund age)
+#   Cell 7  Figure 1: eq. 47 from theory vs simulation (beliefs and curves)
 #   Cell 8  Power check: rejection rates of every check across many seeds
-#   Cell 9  Figure 1 dots vs curves: eq. 47 vs conditioning on the realised return
+#   Cell 9  Figure 1: funds that actually earned r (dots) vs eq. 47 (theory)
 # =====================================================================
 
 #%% 1. Imports and inputs
@@ -42,6 +42,7 @@ SIG_LEVEL = 0.05   # rejection threshold for the statistical checks (5%)
 N_FIG = 5000                 # number of funds for the Figure 1 replication
 FIG1_SEEDS = [1, 2, 3, 4, 5] # several seeds, to show the result doesn't depend on luck
 FIG1_AGES = [2, 5, 10, 20]   # fund ages shown in the paper's Figure 1
+R_MIN, R_MAX, R_STEP = -0.9, 0.9, 0.005   # returns on the x-axis of Figure 1
 
 # ---- Power check settings (cell 8) ----
 RUN_POWER_CHECK = True       # set to False to skip cell 8 (it takes about a minute)
@@ -52,6 +53,8 @@ POWER_SEEDS = 1000           # number of runs; each run repeats checks 1-5
 N_BIG = 50000                # large N, so small-sample noise can be ruled out
 DOTS_AGES = [2, 5, 10]       # ages with enough funds at very negative returns
 MIN_BIN_COUNT = 200          # only show return bins with at least this many funds
+DOTS_R_MIN, DOTS_R_MAX = -0.42, 0.10   # range of returns shown in cell 9
+BIN_WIDTH = 0.04             # width of the return bins for the dots
 
 # Note: omega (= 1/sigma^2) and gamma (= 1/eta^2) are deliberately NOT stored here.
 # They are calculated from sigma and eta inside the functions, so they can never get out of step with them.
@@ -151,39 +154,34 @@ def add_standardised_surprise(df, params):
     return df
 
 
-def survival_prop4(params, n_grid=2000):
-    """Survival probabilities P_1, ..., P_T from the paper's Proposition 4 (p. 18), computed
-    numerically. This is the comparand for check 2: it comes from the model's FORMULA,
-    not from the simulation, so the two can be compared.
-
-    How it works: a fund survives to year t if its belief phi has stayed above phi_bar in
-    every year so far. Averaging over managers' unknown skill (as Proposition 4 does),
-    each year's change in belief is Normal with mean 0 and variance
-        1/(gamma + (t-1)*omega) - 1/(gamma + t*omega)
-    (the drop in the market's uncertainty about skill that year). So we track the
-    density of phi on a grid, one year at a time: spread it out by that Normal change,
-    then cut off the part below phi_bar (those funds close). The area that is left
-    is P_t. This gives the same answer as eqs. 29-30 in Propositions 3-4."""
+def belief_densities(params, n_grid=2000):
     omega, gamma = precisions(params)
     phi0, eta, phi_bar, T = params["phi0"], params["eta"], params["phi_bar"], params["T"]
 
     grid = np.linspace(phi_bar, phi0 + 8 * eta, n_grid)   # beliefs at or above phi_bar
     step = grid[1] - grid[0]
 
-    P = []
-    density = None
+    F = {}
     for t in range(1, T + 1):
-        sd = np.sqrt(1 / (gamma + (t - 1) * omega) - 1 / (gamma + t * omega))
+        sd_change = np.sqrt(1 / (gamma + (t - 1) * omega) - 1 / (gamma + t * omega))
         if t == 1:
-            # Year 1: everyone starts at phi0
-            density = stats.norm.pdf(grid, phi0, sd)
+            F[t] = stats.norm.pdf(grid, phi0, sd_change)
         else:
-            # Spread last year's surviving density by this year's change in belief
-            kernel = stats.norm.pdf(grid[:, None], grid[None, :], sd)   # rows: new phi, cols: old phi
-            density = kernel @ density * step
-        # Only the grid at or above phi_bar is kept, so funds below it drop out automatically
-        P.append(density.sum() * step)
-    return pd.Series(P, index=range(1, T + 1), name="P_t (Prop. 4)")
+            # new density at each grid point = sum over last year's beliefs of
+            # (last year's density) x (chance of moving from there to here) x step
+            move = stats.norm.pdf(grid[:, None], grid[None, :], sd_change)  # rows: new phi, cols: old phi
+            F[t] = move @ F[t - 1] * step
+        # Only grid points >= phi_bar exist, so closed funds are dropped automatically.
+    return grid, step, F
+
+
+def survival_prop4(params):
+    """Survival probabilities P_1, ..., P_T from Proposition 4 (p. 18):
+    P_t = area under F_t = share of funds still alive at the end of year t.
+    This is the comparand for check 2."""
+    grid, step, F = belief_densities(params)
+    P = [F[t].sum() * step for t in range(1, params["T"] + 1)]
+    return pd.Series(P, index=range(1, params["T"] + 1), name="P_t (Prop. 4)")
 
 
 def run_simulation(params, N, seed):
@@ -383,96 +381,161 @@ fig.savefig("survival.png", dpi=150, bbox_inches="tight")
 print("Plot saved as survival.png")
 
 
-#%% 7. Replication of the paper's Figure 1 (p. 24): flow of new funds by fund age
+#%% 7. Figure 1 (p. 24): eq. 47 from THEORY, compared with the SIMULATION
 #
-# What Figure 1 shows:
-#   x-axis: investor return r in the year after the fund reaches age a
-#   y-axis: flow of NEW money (eq. 46, p. 22) = (q_t - q_{t-1}(1 + r)) / q_{t-1},
-#           set to -1 if the fund closes
-#   Each curve: the AVERAGE new flow across all funds alive at age a (eq. 47, p. 23)
+# Figure 1 plots the flow of NEW money into funds of a given age (2, 5, 10, 20 years)
+# against the investor return r they earn in the following year.
+#   y-axis: new flow = (q_t - q_{t-1}(1 + r)) / q_{t-1}   (eq. 46), and -1 if the fund closes
+#   Age convention: the caption's "2 year old fund" uses the return from year 2 to 3,
+#   so paper age a  <->  t = a + 1 in this code.
 #
-# Age convention: the caption says the "2 year" curve uses the return from year 2
-# to year 3, so paper age a corresponds to t = a + 1 in this code.
+# This cell builds the curve TWO independent ways and compares them:
+#   (A) THEORY: eq. 47 exactly as in the paper. Uses F_{t-1}(phi) from Propositions 3-4
+#       (belief_densities, cell 2) and does the integrals numerically. No simulated data.
+#   (B) SIMULATION: the same averaging, but over the simulated funds that are alive at
+#       age a, instead of over the theoretical density F_{t-1}.
+# If the simulation is correct, (B) should match (A), and the simulated distribution
+# of beliefs should match F_{t-1}. Discrepancies that survive a large N would point to
+# an error in the code or in the theory.
+
 
 def eq46_new_flow(r, t, params):
-    """Flow of new money for a fund that does NOT close (eq. 46, p. 22)."""
+    """Flow of new money for a fund that does NOT close after return r in year t (eq. 46, p. 22)."""
     omega, gamma = precisions(params)
-    k = omega / (gamma + t * omega)                 # weight on new information
+    k = omega / (gamma + t * omega)                # weight on new information in year t
     f = params["f"]
     return (k / f - 1) * r + (k / (2 * f))**2 * r**2
 
 
-def figure1_curve(df, age, params, r_grid):
-    """Average new flow at each return in r_grid, for funds alive at the end of year `age` (eq. 47)."""
-    t = age + 1                                                       # the year the return happens
-    phis = df[(df["t"] == age) & (df["closed"] == False)]["phi"].to_numpy()
-    r = r_grid[:, None]
-    phi_old = phis[None, :]
-    R = phi_old + r / (2 * params["f"] / phi_old)
-    phi_new = update_belief(phi_old, R, t, params)
-    closes = phi_new < params["phi_bar"]
-
-    flows = np.where(closes, -1.0, eq46_new_flow(r, t, params))
-    return flows.mean(axis=1)                                         # average over funds
+def rho(r, t, params):
+    omega, gamma = precisions(params)
+    k = omega / (gamma + t * omega)
+    f = params["f"]
+    if r <= -2 * f / k:
+        return np.inf
+    return params["phi_bar"] / (1 + (r / (2 * f)) * k)
 
 
-r_grid = np.linspace(-0.9, 0.9, 361)
+def eq47_theory(r, age, params, grid, step, F):
+    t = age + 1                                   # the year in which return r happens
+    F_prev = F[age]                               # F_{t-1}: beliefs of funds alive at the end of year `age`
 
-# ---- Run the simulation once per seed and compute all four curves ----
-curves = {}       # curves[(seed, age)] = array of average new flows
-sims = {}         # keep each simulated table for the data-points check
+    cutoff = max(params["phi_bar"], rho(r, t, params))
+
+    integral_alive = F_prev.sum() * step                          # integral from phi_bar to infinity
+    integral_stay = F_prev[grid >= cutoff].sum() * step           # integral from the cutoff to infinity
+
+    share_stay = integral_stay / integral_alive
+    share_close = 1 - share_stay
+
+    return share_stay * eq46_new_flow(r, t, params) + share_close * (-1)
+
+
+def eq47_simulated(df, age, r, params):
+    """(B) SIMULATION: the same calculation as eq47_theory, but the shares are COUNTED
+    from the simulated funds alive at the end of year `age`, instead of integrated from F."""
+    t = age + 1
+    alive = df[(df["t"] == age) & (df["closed"] == False)]
+    phis = alive["phi"].to_numpy()                # one belief per surviving fund
+
+    # For every surviving fund: if it earned investor return r next year, would it close?
+    R = phis + r / (2 * params["f"] / phis)       # investor return r -> manager return R
+    new_phi = update_belief(phis, R, t, params)   # updated belief after that return
+    would_close = new_phi < params["phi_bar"]     # True / False for each fund
+
+    share_close = would_close.sum() / len(phis)   # count of closing funds / all funds
+    share_stay = 1 - share_close
+
+    return share_stay * eq46_new_flow(r, t, params) + share_close * (-1)
+
+
+# ---- Theory: belief densities F_t (computed once) ----
+grid, step, F = belief_densities(params)
+
+# ---- Simulation: one run per seed ----
+sims = {}
 for seed in FIG1_SEEDS:
-    df_fig = run_simulation(params, N_FIG, seed)
-    sims[seed] = df_fig
-    for age in FIG1_AGES:
-        curves[(seed, age)] = figure1_curve(df_fig, age, params, r_grid)
+    sims[seed] = run_simulation(params, N_FIG, seed)
 
-# ---- Plot: same layout as the paper's Figure 1 ----
+
+# ---- Comparison 1: distribution of beliefs, theory vs simulation ----
+# H0: the beliefs of simulated survivors at age a follow the theoretical distribution F_a
+# (normalised). Test: Kolmogorov-Smirnov test, reject if p < SIG_LEVEL.
+print("FIGURE 1, COMPARISON 1: beliefs of surviving funds, theory (F_t) vs simulation")
+print(f"  H0: simulated beliefs ~ theoretical F_t   |   test: Kolmogorov-Smirnov   |   reject if p < {SIG_LEVEL}")
+fig, axes = plt.subplots(1, len(FIG1_AGES), figsize=(4 * len(FIG1_AGES), 3.5), sharey=True)
+ks_rows = []
+for ax, age in zip(axes, FIG1_AGES):
+    theory_cdf = np.cumsum(F[age]) / F[age].sum()             # cumulative share of survivors below each belief
+    sim_phis = sims[SEED][(sims[SEED]["t"] == age) & (sims[SEED]["closed"] == False)]["phi"].to_numpy()
+
+    def cdf_at(x, theory_cdf=theory_cdf):
+        return np.interp(x, grid, theory_cdf)
+    ks = stats.kstest(sim_phis, cdf_at)
+    ks_rows.append([age, len(sim_phis), ks.statistic, ks.pvalue, verdict(ks.pvalue)])
+
+    sorted_phis = np.sort(sim_phis)
+    ax.plot(grid, theory_cdf, color="black", linewidth=1.5, label="Theory (Prop. 3-4)")
+    ax.step(sorted_phis, np.arange(1, len(sorted_phis) + 1) / len(sorted_phis), color="tab:orange",
+            linewidth=1, label=f"Simulation (seed {SEED})")
+    ax.set_xlim(params["phi_bar"], 0.2)
+    ax.set_title(f"Age {age}")
+    ax.set_xlabel("Belief phi")
+axes[0].set_ylabel("Cumulative share of survivors")
+axes[0].legend(fontsize=8)
+fig.suptitle(f"Beliefs of surviving funds: theory vs simulation (N = {N_FIG})", y=1.04)
+fig.savefig("beliefs_theory_vs_sim.png", dpi=150, bbox_inches="tight")
+ks_table = pd.DataFrame(ks_rows, columns=["age", "survivors", "KS statistic", "p-value", "Verdict"])
+print(ks_table.round(4).to_string(index=False))
+print("  Plot saved as beliefs_theory_vs_sim.png")
+print()
+
+
+# ---- Comparison 2: the Figure 1 curves, theory vs simulation ----
+r_grid = np.arange(R_MIN, R_MAX + R_STEP / 2, R_STEP)
+
+theory_curves = {}                                # theory_curves[age] = list of flows, one per r
+for age in FIG1_AGES:
+    theory_curves[age] = [eq47_theory(r, age, params, grid, step, F) for r in r_grid]
+
+sim_curves = {}                                   # sim_curves[(seed, age)] = list of flows, one per r
+for seed in FIG1_SEEDS:
+    for age in FIG1_AGES:
+        sim_curves[(seed, age)] = [eq47_simulated(sims[seed], age, r, params) for r in r_grid]
+
 colours = {2: "tab:red", 5: "tab:green", 10: "tab:blue", 20: "tab:purple"}
 fig, ax = plt.subplots(figsize=(8, 5.5))
-
 for age in FIG1_AGES:
+    ax.plot(r_grid, theory_curves[age], color=colours[age], linewidth=2.5, alpha=0.5,
+            label=f"{age} years: theory (eq. 47)")
     for i, seed in enumerate(FIG1_SEEDS):
-        ax.plot(r_grid, curves[(seed, age)], color=colours[age], linewidth=1,
-                alpha=0.6, label=f"{age} years" if i == 0 else None)
-
-# Check: actual simulated outcomes (seed 1) as dots, averaged within return bins.
-# Where there is enough data, the dots should sit on the curves.
-df1 = sims[FIG1_SEEDS[0]].copy()
-df1["new_flow"] = np.where(df1["closed"], -1.0, df1["flow"] - df1["r"])
-bins = np.arange(-0.4, 0.42, 0.04)
-for age in FIG1_AGES:
-    year = df1[df1["t"] == age + 1].copy()
-    year["bin"] = pd.cut(year["r"], bins)
-    binned = year.groupby("bin", observed=True).agg(r=("r", "mean"), nf=("new_flow", "mean"), n=("r", "size"))
-    binned = binned[binned["n"] >= 30]                   # only bins with enough funds
-    ax.scatter(binned["r"], binned["nf"], color=colours[age], s=18, edgecolor="black", linewidth=0.4, zorder=3)
-
+        ax.plot(r_grid, sim_curves[(seed, age)], color=colours[age], linewidth=0.8, linestyle="--",
+                label=f"{age} years: simulation ({len(FIG1_SEEDS)} seeds)" if i == 0 else None)
 ax.axhline(0, color="grey", linewidth=0.8)
 ax.axvline(0, color="grey", linewidth=0.8)
-ax.set_xlim(-0.9, 0.9)
+ax.set_xlim(R_MIN, R_MAX)
 ax.set_ylim(-1.1, 2.3)
 ax.set_xlabel("Investor return r")
 ax.set_ylabel("Flow of new funds")
-ax.set_title(f"Replication of Figure 1: flow of new funds by fund age\n"
-             f"(N = {N_FIG}, seeds {FIG1_SEEDS}; dots = simulated outcomes, seed {FIG1_SEEDS[0]})")
-ax.legend(title="Fund age")
+ax.set_title(f"Replication of Figure 1: eq. 47 from theory vs simulation (N = {N_FIG})")
+ax.legend(fontsize=7, ncol=2)
 fig.savefig("figure1_replication.png", dpi=150, bbox_inches="tight")
 print("Plot saved as figure1_replication.png")
 print()
 
-# ---- Table of values, to compare with the paper's Figure 1 ----
-# Mean across seeds, and the largest difference between seeds (shows how much luck matters).
 check_r = [-0.6, -0.4, -0.2, -0.1, 0.1, 0.2, 0.4]
 rows = []
 for age in FIG1_AGES:
     for rv in check_r:
-        idx = np.argmin(np.abs(r_grid - rv))
-        vals = [curves[(s, age)][idx] for s in FIG1_SEEDS]
-        rows.append([age, rv, np.mean(vals), max(vals) - min(vals)])
-fig1_table = pd.DataFrame(rows, columns=["age", "r", "mean new flow", "range across seeds"])
-print("FIGURE 1 VALUES (compare with values read off the paper's Figure 1)")
-print(fig1_table.round(3).to_string(index=False))
+        theory_value = eq47_theory(rv, age, params, grid, step, F)
+        sim_values = [eq47_simulated(sims[s], age, rv, params) for s in FIG1_SEEDS]
+        rows.append([age, rv, theory_value, np.mean(sim_values),
+                     max(abs(v - theory_value) for v in sim_values)])
+fig1_table = pd.DataFrame(rows, columns=["age", "r", "theory (eq. 47)", "simulation (mean of seeds)",
+                                         "largest |sim - theory|"])
+print("FIGURE 1, COMPARISON 2: eq. 47 theory vs simulation (also compare with values read off the paper)")
+print(fig1_table.round(4).to_string(index=False))
+print()
 
 
 #%% 8. Power check: how often does each check reject, across many seeds?
@@ -525,68 +588,88 @@ if RUN_POWER_CHECK:
     print()
 
 
-#%% 9. Figure 1: why do the dots fall below the curves for bad returns?
-# Two different questions give two different curves:
-#   (a) eq. 47 (the paper, and the curves in cell 7): average over ALL funds alive at
-#       age a, as if every one of them received return r. Each fund gets equal weight.
-#   (b) the dots: average over the funds that ACTUALLY earned return r.
-# In the model, r is more volatile for funds with low beliefs (eq. 50: active share
-# 2f/phi is larger). So among the funds that actually earned a very bad r, low-belief
-# funds are over-represented, and more of them close. To get (b) from the formula,
-# weight each fund by how likely it was to earn r given its belief (Bayes' rule):
-#   weight = Normal density of r with mean 0 and sd (2f/phi) * sqrt(1/omega + 1/(gamma + (t-1)*omega))
-# Using a large N rules out small-sample noise as the explanation.
+#%% 9. Figure 1: funds that ACTUALLY earned r (dots) vs eq. 47 (theory)
+#
+# Eq. 47 (cell 7) answers: "if every fund alive at age a received return r, what would
+# the average new flow be?" Every surviving fund counts in proportion to F_{t-1}(phi),
+# whatever its chance of actually earning r.
+#
+# The dots answer: "among the simulated funds that ACTUALLY earned (about) r, what was
+# the average new flow?" This is what empirical studies measure when they group funds
+# by realised returns.
+#
+# These differ because funds with low beliefs have a larger active share (2f/phi), so
+# their returns are more volatile (eq. 50). They are therefore over-represented among
+# funds that actually earn very bad returns, and they are the ones closest to exit.
+#
+# The theoretical version of the dots weights F_{t-1}(phi) by the likelihood of earning
+# r given phi (Bayes' rule):
+#     weight(phi) = F_{t-1}(phi) * P(r | phi),   P(r | phi) = Normal density, mean 0, sd = sd_r(phi)
+#     sd_r(phi)   = (2f / phi) * sqrt(1/omega + 1/(gamma + (t-1)*omega))
+# (active share x sd of the surprise R - phi: luck plus remaining uncertainty about skill).
+# A large N rules out small-sample noise as the explanation.
 
-def figure1_curve_weighted(df, age, params, r_values):
-    """Like figure1_curve, but each fund is weighted by the likelihood of earning r (version b)."""
+
+def eq47_theory_weighted(r, age, params, grid, step, F):
     omega, gamma = precisions(params)
     t = age + 1
-    phis = df[(df["t"] == age) & (df["closed"] == False)]["phi"].to_numpy()
-    r = np.asarray(r_values)[:, None]
-    phi_old = phis[None, :]
-    R = phi_old + r / (2 * params["f"] / phi_old)
-    closes = update_belief(phi_old, R, t, params) < params["phi_bar"]
-    flows = np.where(closes, -1.0, eq46_new_flow(r, t, params))
-    sd_r = (2 * params["f"] / phi_old) * np.sqrt(1 / omega + 1 / (gamma + (t - 1) * omega))
-    w = stats.norm.pdf(r, 0, sd_r)
-    return (flows * w).sum(axis=1) / w.sum(axis=1)
+    F_prev = F[age]
+
+    sd_r = (2 * params["f"] / grid) * np.sqrt(1 / omega + 1 / (gamma + (t - 1) * omega))
+    likelihood = stats.norm.pdf(r, 0, sd_r)       # how likely each belief level is to produce r
+    weight = F_prev * likelihood                  # Bayes: prior density x likelihood
+
+    cutoff = max(params["phi_bar"], rho(r, t, params))
+    share_stay = weight[grid >= cutoff].sum() / weight.sum()
+    share_close = 1 - share_stay
+
+    return share_stay * eq46_new_flow(r, t, params) + share_close * (-1)
 
 
+# ---- Simulation with a large N ----
 df_big = run_simulation(params, N_BIG, SEED)
+
+# New flow for every fund-year (eq. 46 definition): -1 if the fund closed, otherwise
+# total flow minus the growth from the return itself
 df_big["new_flow"] = np.where(df_big["closed"], -1.0, df_big["flow"] - df_big["r"])
 
+# ---- Dots: group funds by the return they actually earned ----
+bin_edges = np.arange(DOTS_R_MIN, DOTS_R_MAX + BIN_WIDTH / 2, BIN_WIDTH)
+dot_rows = []
+for age in DOTS_AGES:
+    year = df_big[df_big["t"] == age + 1]          # all funds alive at age a, in their next year
+    for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
+        in_bin = year[(year["r"] >= lo) & (year["r"] < hi)]
+        if len(in_bin) < MIN_BIN_COUNT:
+            continue                               # too few funds for a reliable average
+        r_mean = in_bin["r"].mean()
+        dot_rows.append([age, len(in_bin), r_mean, in_bin["new_flow"].mean(),
+                         eq47_theory(r_mean, age, params, grid, step, F),
+                         eq47_theory_weighted(r_mean, age, params, grid, step, F)])
+dots_table = pd.DataFrame(dot_rows, columns=["age", "n", "r", "dots (simulated)",
+                                             "eq. 47 (theory)", "weighted (theory)"])
+
+# ---- Plot ----
+r_neg = np.arange(DOTS_R_MIN, DOTS_R_MAX + 0.0025, 0.0025)
 fig, ax = plt.subplots(figsize=(8, 5.5))
-r_neg = np.linspace(-0.45, 0.1, 221)
-dots_rows = []
 for age in DOTS_AGES:
     c = colours[age]
-    ax.plot(r_neg, figure1_curve(df_big, age, params, r_neg), color=c, linestyle="--", linewidth=1,
-            label=f"{age} yrs: eq. 47 (every fund gets r)")
-    ax.plot(r_neg, figure1_curve_weighted(df_big, age, params, r_neg), color=c, linewidth=1.5,
-            label=f"{age} yrs: weighted by P(r | phi)")
-
-    year = df_big[df_big["t"] == age + 1].copy()
-    year["bin"] = pd.cut(year["r"], np.arange(-0.42, 0.12, 0.04))
-    b = year.groupby("bin", observed=True).agg(r=("r", "mean"), dots=("new_flow", "mean"), n=("r", "size"))
-    b = b[b["n"] >= MIN_BIN_COUNT]
-    ax.scatter(b["r"], b["dots"], color=c, s=20, edgecolor="black", linewidth=0.4, zorder=3)
-
-    b["eq. 47"] = figure1_curve(df_big, age, params, b["r"].to_numpy())
-    b["weighted"] = figure1_curve_weighted(df_big, age, params, b["r"].to_numpy())
-    b.insert(0, "age", age)
-    dots_rows.append(b[b["r"] < -0.05])
-
+    ax.plot(r_neg, [eq47_theory(r, age, params, grid, step, F) for r in r_neg],
+            color=c, linestyle="--", linewidth=1, label=f"{age} yrs: eq. 47 (every fund gets r)")
+    ax.plot(r_neg, [eq47_theory_weighted(r, age, params, grid, step, F) for r in r_neg],
+            color=c, linewidth=1.5, label=f"{age} yrs: weighted by P(r | phi)")
+    d = dots_table[dots_table["age"] == age]
+    ax.scatter(d["r"], d["dots (simulated)"], color=c, s=20, edgecolor="black", linewidth=0.4, zorder=3)
 ax.axhline(0, color="grey", linewidth=0.8)
-ax.set_xlim(-0.45, 0.1)
+ax.set_xlim(DOTS_R_MIN, DOTS_R_MAX)
 ax.set_ylim(-1.1, 0.4)
 ax.set_xlabel("Investor return r")
 ax.set_ylabel("Flow of new funds")
-ax.set_title(f"Figure 1, negative returns: eq. 47 vs conditioning on the realised return\n"
-             f"(N = {N_BIG}, seed {SEED}; dots = simulated outcomes)")
+ax.set_title(f"Funds that actually earned r (dots, N = {N_BIG}) vs theory\n"
+             f"dashed: eq. 47; solid: eq. 47 weighted by the likelihood of earning r")
 ax.legend(fontsize=8)
-fig.savefig("figure1_dots_vs_curves.png", dpi=150, bbox_inches="tight")
-print("Plot saved as figure1_dots_vs_curves.png")
+fig.savefig("figure1_dots_vs_theory.png", dpi=150, bbox_inches="tight")
+print("Plot saved as figure1_dots_vs_theory.png")
 
-dots_table = pd.concat(dots_rows)[["age", "n", "r", "dots", "eq. 47", "weighted"]]
-print(f"FIGURE 1 DOTS vs CURVES (N = {N_BIG}, negative returns)")
-print(dots_table.round(3).to_string(index=False))
+print(f"FIGURE 1 DOTS vs THEORY (N = {N_BIG}, seed {SEED})")
+print(dots_table[dots_table["r"] < -0.05].round(3).to_string(index=False))
